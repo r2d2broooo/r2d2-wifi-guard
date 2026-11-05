@@ -1,0 +1,71 @@
+#!<workspace>/telegram-bots/venv/bin/python
+"""Send wifi-guard's queued outage alerts to the personal Telegram chat.
+
+The guard queues one line per outage in pending_alerts while offline; this
+sends them once the internet is back. Unsent lines stay queued for the next
+try. Uses the trading bots' existing telegram_sender (token from their .env).
+
+    wifi-guard-notify            flush the queue
+    wifi-guard-notify --test     queue + send a test message
+"""
+import asyncio
+import fcntl
+import os
+import socket
+import sys
+
+import urllib.request
+import urllib.parse
+
+class _Sender:
+    async def send_message(self, target, text):
+        token=os.environ.get('WIFI_GUARD_TELEGRAM_TOKEN','')
+        chat=os.environ.get('WIFI_GUARD_TELEGRAM_CHAT_ID','')
+        if not token or not chat:
+            raise RuntimeError('Optional Telegram notifications are not configured')
+        payload=urllib.parse.urlencode({'chat_id':chat,'text':text}).encode()
+        def send():
+            with urllib.request.urlopen('https://api.telegram.org/bot'+token+'/sendMessage',data=payload,timeout=20) as r:
+                return r.read()
+        return await asyncio.to_thread(send)
+telegram_sender=_Sender()
+
+STATE_DIR = os.path.expanduser("~/.local/state/wifi-guard")
+QUEUE = os.path.join(STATE_DIR, "pending_alerts")
+
+
+def main() -> int:
+    os.makedirs(STATE_DIR, exist_ok=True)
+    if "--test" in sys.argv:
+        with open(QUEUE, "a") as f:
+            f.write(f"📶 WiFi guard test alert from {socket.gethostname()} — alerts are working.\n")
+    with open(QUEUE + ".lock", "w") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return 0  # another flush is already running
+        try:
+            with open(QUEUE) as f:
+                pending = [line.rstrip("\n") for line in f if line.strip()]
+        except FileNotFoundError:
+            return 0
+        sent = 0
+        for msg in pending:
+            try:
+                asyncio.run(asyncio.wait_for(telegram_sender.send_message("personal", msg), 30))
+            except Exception as e:  # still offline / Telegram down — keep the rest queued
+                print(f"send failed, {len(pending) - sent} left queued: {e}", file=sys.stderr)
+                break
+            sent += 1
+        # Re-read so lines the guard appended while we were sending survive.
+        with open(QUEUE) as f:
+            now = [line for line in f if line.strip()]
+        with open(QUEUE + ".tmp", "w") as f:
+            f.writelines(now[sent:])
+        os.replace(QUEUE + ".tmp", QUEUE)
+        print(f"sent {sent}, queued {len(now) - sent}")
+        return 0 if sent == len(pending) else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

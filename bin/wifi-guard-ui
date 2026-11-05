@@ -1,0 +1,585 @@
+#!/usr/bin/python3
+"""WiFi Guard — top-bar icon + status window for the wifi-guard service.
+
+The reconnecting itself is done by the wifi-guard systemd user service; this
+app only shows what it is doing and offers Reconnect / Pause / Resume. Quitting
+the app does NOT stop the guard.
+
+    wifi-guard-ui          top-bar icon only (what autostart runs)
+    wifi-guard-ui --show   icon + open the window (what the app launcher runs)
+
+The icon is a StatusNotifierItem spoken directly over D-Bus (no AppIndicator
+library is installed), which Ubuntu's AppIndicator extension shows in the top bar.
+"""
+import os
+import subprocess
+import sys
+import time
+
+import gi
+
+gi.require_version("Gtk", "3.0")
+gi.require_version("Notify", "0.7")
+gi.require_version("GdkPixbuf", "2.0")
+from gi.repository import GdkPixbuf, Gio, GLib, Gtk, Notify  # noqa: E402
+
+APP_ID = "com.r2d2.WifiGuard"
+IFACE = "wlp4s0"
+DASH_PORT = 8420
+GRACE = 45  # must match wifi-guard: outages shorter than this healed by themselves
+HOME = os.path.expanduser("~")
+GUARD = f"{HOME}/.local/bin/wifi-guard"
+NOTIFY_BIN = f"{HOME}/.local/bin/wifi-guard-notify"
+CONFIG_DIR = f"{HOME}/.config/wifi-guard"
+STATE_DIR = f"{HOME}/.local/state/wifi-guard"
+CONFIG = f"{CONFIG_DIR}/config"
+PAUSE_FILE = f"{CONFIG_DIR}/paused"
+EVENTS = f"{STATE_DIR}/events.log"
+OUTAGES = f"{STATE_DIR}/outages.tsv"
+PHASE = f"{STATE_DIR}/phase"
+ALERTS = f"{STATE_DIR}/pending_alerts"
+
+# ---------------------------------------------------------------- icons
+COLORS = {"ok": "#3fb950", "warn": "#e3b341", "down": "#f85149", "off": "#9da5ae"}
+ICON_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+<g fill="none" stroke="{c}" stroke-width="2.4" stroke-linecap="round">
+<path d="M2.5 9.5a14 14 0 0 1 19 0"/><path d="M5.8 13a9.2 9.2 0 0 1 12.4 0"/>
+<path d="M9.1 16.4a4.4 4.4 0 0 1 5.8 0"/></g>
+<circle cx="12" cy="19.6" r="1.8" fill="{c}"/></svg>"""
+
+
+def icon_pixbuf(level: str, size: int) -> GdkPixbuf.Pixbuf:
+    data = GLib.Bytes.new(ICON_SVG.format(c=COLORS[level]).encode())
+    stream = Gio.MemoryInputStream.new_from_bytes(data)
+    return GdkPixbuf.Pixbuf.new_from_stream_at_scale(stream, size, size, True, None)
+
+
+def argb(pb: GdkPixbuf.Pixbuf) -> tuple:
+    """Pixbuf (RGBA rows) -> SNI pixmap (width, height, ARGB32 network byte order)."""
+    w, h, stride, px = pb.get_width(), pb.get_height(), pb.get_rowstride(), pb.get_pixels()
+    out = bytearray()
+    for y in range(h):
+        row = px[y * stride:y * stride + w * 4]
+        for x in range(0, w * 4, 4):
+            r, g, b, a = row[x:x + 4]
+            out += bytes((a, r, g, b))
+    return (w, h, bytes(out))
+
+
+# ---------------------------------------------------------------- status
+def sh(*cmd, timeout=4) -> str:
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout).stdout.strip()
+    except Exception:
+        return ""
+
+
+def read_lines(path: str) -> list:
+    try:
+        with open(path) as f:
+            return [line.rstrip("\n") for line in f if line.strip()]
+    except OSError:
+        return []
+
+
+def human(s: int) -> str:
+    if s >= 3600:
+        return f"{s // 3600}h {s % 3600 // 60:02d}m"
+    if s >= 60:
+        return f"{s // 60}m {s % 60:02d}s"
+    return f"{s}s"
+
+
+def config_get(key: str, default: str) -> str:
+    val = default
+    for line in read_lines(CONFIG):
+        if line.startswith(key + "="):
+            val = line.split("=", 1)[1]
+    return val
+
+
+def config_set(key: str, value: str) -> None:
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    lines = [line for line in read_lines(CONFIG) if not line.startswith(key + "=")]
+    with open(CONFIG, "w") as f:
+        f.write("\n".join(lines + [f"{key}={value}"]) + "\n")
+
+
+class Status:
+    """One snapshot of the link + guard, refreshed every few seconds."""
+
+    def __init__(self):
+        dev = {}
+        for line in sh("nmcli", "-t", "-f", "GENERAL.STATE,GENERAL.CONNECTION,IP4.ADDRESS",
+                       "device", "show", IFACE).splitlines():
+            k, _, v = line.partition(":")
+            dev.setdefault(k, v)
+        self.connected = dev.get("GENERAL.STATE", "").startswith("100")
+        self.network = dev.get("GENERAL.CONNECTION", "") if self.connected else ""
+        self.ip = dev.get("IP4.ADDRESS[1]", "").split("/")[0]
+        self.signal = ""
+        if self.connected:
+            for line in sh("nmcli", "-t", "-f", "IN-USE,SIGNAL", "device", "wifi", "list",
+                           "ifname", IFACE, "--rescan", "no").splitlines():
+                if line.startswith("*:"):
+                    self.signal = line.split(":")[1] + "%"
+        self.guard_running = sh("systemctl", "--user", "is-active", "wifi-guard") == "active"
+        self.paused = os.path.exists(PAUSE_FILE)
+        phase = (read_lines(PHASE) or ["unknown\t0"])[0].split("\t")
+        self.phase, self.phase_since = phase[0], int(phase[1]) if len(phase) > 1 else 0
+
+        if self.paused:
+            self.level, self.title = "off", "Guard paused"
+        elif not self.guard_running:
+            self.level, self.title = "off", "Guard service is not running"
+        elif self.connected and self.phase in ("ok", "unknown"):
+            self.level, self.title = "ok", f"Connected to {self.network}"
+        elif self.connected and self.phase == "router-unreachable":
+            self.level, self.title = "warn", "Connected, but the router is not answering"
+        elif self.phase == "waiting":
+            self.level, self.title = "warn", "WiFi dropped — waiting for it to come back"
+        elif self.phase == "no-network":
+            self.level, self.title = "down", "Offline — no saved network in range"
+        else:
+            self.level, self.title = "down", "Offline — reconnecting…"
+
+    @property
+    def since(self) -> str:
+        if not self.phase_since or self.level == "off":
+            return ""
+        return f"for {human(int(time.time()) - self.phase_since)}"
+
+
+def load_outages() -> list:
+    rows = []
+    for line in read_lines(OUTAGES):
+        parts = line.split("\t")
+        if len(parts) == 4 and parts[0].isdigit():
+            rows.append((int(parts[0]), int(parts[1]), int(parts[2]), parts[3]))
+    return rows
+
+
+# ---------------------------------------------------------------- tray icon (SNI + dbusmenu)
+SNI_XML = """<node>
+<interface name="org.kde.StatusNotifierItem">
+  <property name="Category" type="s" access="read"/><property name="Id" type="s" access="read"/>
+  <property name="Title" type="s" access="read"/><property name="Status" type="s" access="read"/>
+  <property name="WindowId" type="i" access="read"/><property name="IconName" type="s" access="read"/>
+  <property name="IconPixmap" type="a(iiay)" access="read"/>
+  <property name="OverlayIconName" type="s" access="read"/>
+  <property name="OverlayIconPixmap" type="a(iiay)" access="read"/>
+  <property name="AttentionIconName" type="s" access="read"/>
+  <property name="AttentionIconPixmap" type="a(iiay)" access="read"/>
+  <property name="IconThemePath" type="s" access="read"/>
+  <property name="ToolTip" type="(sa(iiay)ss)" access="read"/>
+  <property name="ItemIsMenu" type="b" access="read"/><property name="Menu" type="o" access="read"/>
+  <method name="Activate"><arg type="i" direction="in"/><arg type="i" direction="in"/></method>
+  <method name="SecondaryActivate"><arg type="i" direction="in"/><arg type="i" direction="in"/></method>
+  <method name="ContextMenu"><arg type="i" direction="in"/><arg type="i" direction="in"/></method>
+  <method name="Scroll"><arg type="i" direction="in"/><arg type="s" direction="in"/></method>
+  <signal name="NewIcon"/><signal name="NewToolTip"/><signal name="NewTitle"/>
+  <signal name="NewStatus"><arg type="s"/></signal>
+</interface></node>"""
+
+MENU_XML = """<node>
+<interface name="com.canonical.dbusmenu">
+  <property name="Version" type="u" access="read"/><property name="TextDirection" type="s" access="read"/>
+  <property name="Status" type="s" access="read"/><property name="IconThemePath" type="as" access="read"/>
+  <method name="GetLayout"><arg type="i" direction="in"/><arg type="i" direction="in"/>
+    <arg type="as" direction="in"/><arg type="u" direction="out"/><arg type="(ia{sv}av)" direction="out"/></method>
+  <method name="GetGroupProperties"><arg type="ai" direction="in"/><arg type="as" direction="in"/>
+    <arg type="a(ia{sv})" direction="out"/></method>
+  <method name="GetProperty"><arg type="i" direction="in"/><arg type="s" direction="in"/>
+    <arg type="v" direction="out"/></method>
+  <method name="Event"><arg type="i" direction="in"/><arg type="s" direction="in"/>
+    <arg type="v" direction="in"/><arg type="u" direction="in"/></method>
+  <method name="EventGroup"><arg type="a(isvu)" direction="in"/><arg type="ai" direction="out"/></method>
+  <method name="AboutToShow"><arg type="i" direction="in"/><arg type="b" direction="out"/></method>
+  <method name="AboutToShowGroup"><arg type="ai" direction="in"/><arg type="ai" direction="out"/>
+    <arg type="ai" direction="out"/></method>
+  <signal name="ItemsPropertiesUpdated"><arg type="a(ia{sv})"/><arg type="a(ias)"/></signal>
+  <signal name="LayoutUpdated"><arg type="u"/><arg type="i"/></signal>
+  <signal name="ItemActivationRequested"><arg type="i"/><arg type="u"/></signal>
+</interface></node>"""
+
+SNI_PATH, MENU_PATH = "/StatusNotifierItem", "/MenuBar"
+WATCHER = "org.kde.StatusNotifierWatcher"
+
+
+class TrayIcon:
+    def __init__(self, app):
+        self.app = app
+        self.level, self.tooltip = "off", "WiFi Guard"
+        self.menu_items: list = []   # [(id, props dict of GLib.Variant, action)]
+        self.revision = 1
+        self.pixmaps = {lvl: [argb(icon_pixbuf(lvl, s)) for s in (22, 44)] for lvl in COLORS}
+        self.bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        self.name = f"org.kde.StatusNotifierItem-{os.getpid()}-1"
+        self.bus.register_object(SNI_PATH, Gio.DBusNodeInfo.new_for_xml(SNI_XML).interfaces[0],
+                                 self._sni_call, self._sni_prop, None)
+        self.bus.register_object(MENU_PATH, Gio.DBusNodeInfo.new_for_xml(MENU_XML).interfaces[0],
+                                 self._menu_call, self._menu_prop, None)
+        Gio.bus_own_name_on_connection(self.bus, self.name, Gio.BusNameOwnerFlags.NONE, None, None)
+        # (Re-)register whenever the top bar's watcher appears, e.g. after a GNOME Shell restart.
+        Gio.bus_watch_name_on_connection(self.bus, WATCHER, Gio.BusNameWatcherFlags.NONE,
+                                         self._register, None)
+
+    def _register(self, *_):
+        self.bus.call(WATCHER, "/StatusNotifierWatcher", WATCHER, "RegisterStatusNotifierItem",
+                      GLib.Variant("(s)", (self.name,)), None, Gio.DBusCallFlags.NONE, -1, None, None)
+
+    def _emit(self, path, iface, signal, params=None):
+        try:
+            self.bus.emit_signal(None, path, iface, signal, params)
+        except GLib.Error:
+            pass
+
+    # -- public
+    def update(self, level: str, tooltip: str, items: list):
+        if level != self.level:
+            self.level = level
+            self._emit(SNI_PATH, "org.kde.StatusNotifierItem", "NewIcon")
+        if tooltip != self.tooltip:
+            self.tooltip = tooltip
+            self._emit(SNI_PATH, "org.kde.StatusNotifierItem", "NewToolTip")
+        labels = [(i, {k: v.unpack() for k, v in p.items()}) for i, p, _ in items]
+        if labels != [(i, {k: v.unpack() for k, v in p.items()}) for i, p, _ in self.menu_items]:
+            self.menu_items = items
+            self.revision += 1
+            self._emit(MENU_PATH, "com.canonical.dbusmenu", "LayoutUpdated",
+                       GLib.Variant("(ui)", (self.revision, 0)))
+
+    # -- StatusNotifierItem
+    def _sni_prop(self, _bus, _sender, _path, _iface, name):
+        pix = self.pixmaps[self.level]
+        return {
+            "Category": GLib.Variant("s", "Hardware"),
+            "Id": GLib.Variant("s", "wifi-guard"),
+            "Title": GLib.Variant("s", "WiFi Guard"),
+            "Status": GLib.Variant("s", "Active"),
+            "WindowId": GLib.Variant("i", 0),
+            "IconName": GLib.Variant("s", ""),
+            "IconPixmap": GLib.Variant("a(iiay)", pix),
+            "OverlayIconName": GLib.Variant("s", ""),
+            "OverlayIconPixmap": GLib.Variant("a(iiay)", []),
+            "AttentionIconName": GLib.Variant("s", ""),
+            "AttentionIconPixmap": GLib.Variant("a(iiay)", []),
+            "IconThemePath": GLib.Variant("s", ""),
+            "ToolTip": GLib.Variant("(sa(iiay)ss)", ("", pix, "WiFi Guard", self.tooltip)),
+            "ItemIsMenu": GLib.Variant("b", False),
+            "Menu": GLib.Variant("o", MENU_PATH),
+        }.get(name)
+
+    def _sni_call(self, _bus, _sender, _path, _iface, method, _params, invocation):
+        if method == "Activate":
+            GLib.idle_add(self.app.show_window)
+        invocation.return_value(None)
+
+    # -- dbusmenu
+    def _props(self, item_id):
+        if item_id == 0:
+            return {"children-display": GLib.Variant("s", "submenu")}
+        return next((p for i, p, _ in self.menu_items if i == item_id), {})
+
+    def _menu_prop(self, _bus, _sender, _path, _iface, name):
+        return {"Version": GLib.Variant("u", 3), "TextDirection": GLib.Variant("s", "ltr"),
+                "Status": GLib.Variant("s", "normal"),
+                "IconThemePath": GLib.Variant("as", [])}.get(name)
+
+    def _click(self, item_id):
+        for i, _, action in self.menu_items:
+            if i == item_id and action:
+                GLib.idle_add(action)
+
+    def _menu_call(self, _bus, _sender, _path, _iface, method, params, invocation):
+        if method == "GetLayout":
+            children = [GLib.Variant("(ia{sv}av)", (i, p, [])) for i, p, _ in self.menu_items]
+            invocation.return_value(GLib.Variant(
+                "(u(ia{sv}av))", (self.revision, (0, self._props(0), children))))
+        elif method == "GetGroupProperties":
+            ids = params.unpack()[0] or [i for i, _, _ in self.menu_items]
+            invocation.return_value(GLib.Variant("(a(ia{sv}))", ([(i, self._props(i)) for i in ids],)))
+        elif method == "GetProperty":
+            item_id, name = params.unpack()
+            invocation.return_value(GLib.Variant("(v)", (self._props(item_id).get(
+                name, GLib.Variant("s", "")),)))
+        elif method == "Event":
+            item_id, event = params.unpack()[:2]
+            if event == "clicked":
+                self._click(item_id)
+            invocation.return_value(None)
+        elif method == "EventGroup":
+            for item_id, event, *_ in params.unpack()[0]:
+                if event == "clicked":
+                    self._click(item_id)
+            invocation.return_value(GLib.Variant("(ai)", ([],)))
+        elif method == "AboutToShow":
+            invocation.return_value(GLib.Variant("(b)", (False,)))
+        elif method == "AboutToShowGroup":
+            invocation.return_value(GLib.Variant("(aiai)", ([], [])))
+        else:
+            invocation.return_value(None)
+
+
+def menu_item(item_id, label=None, action=None, enabled=True, separator=False):
+    if separator:
+        return (item_id, {"type": GLib.Variant("s", "separator")}, None)
+    return (item_id, {"label": GLib.Variant("s", label), "enabled": GLib.Variant("b", enabled)}, action)
+
+
+# ---------------------------------------------------------------- window
+class GuardWindow(Gtk.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app, title="WiFi Guard")
+        self.app = app
+        self.set_default_size(620, 680)
+        self.set_icon(icon_pixbuf("ok", 128))
+        self.connect("delete-event", lambda *_: self.hide() or True)  # close = hide; icon stays
+        self._outages_sig = self._events_sig = None
+
+        hb = Gtk.HeaderBar(title="WiFi Guard", show_close_button=True)
+        self.set_titlebar(hb)
+
+        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14, margin=18)
+        self.add(root)
+
+        # status header
+        head = Gtk.Box(spacing=14)
+        self.big_icon = Gtk.Image()
+        head.pack_start(self.big_icon, False, False, 0)
+        titles = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2, valign=Gtk.Align.CENTER)
+        self.title_lbl = Gtk.Label(xalign=0)
+        self.sub_lbl = Gtk.Label(xalign=0)
+        self.sub_lbl.get_style_context().add_class("dim-label")
+        titles.pack_start(self.title_lbl, False, False, 0)
+        titles.pack_start(self.sub_lbl, False, False, 0)
+        head.pack_start(titles, True, True, 0)
+        root.pack_start(head, False, False, 0)
+
+        # details
+        grid = Gtk.Grid(column_spacing=16, row_spacing=6)
+        self.info = {}
+        for row, key in enumerate(["Network", "Signal", "This PC", "Dashboard (home WiFi)",
+                                   "Dashboard (Tailscale)", "Guard service"]):
+            k = Gtk.Label(label=key, xalign=0)
+            k.get_style_context().add_class("dim-label")
+            v = Gtk.Label(xalign=0, selectable=True, can_focus=False)  # copyable, never auto-selected
+            grid.attach(k, 0, row, 1, 1)
+            grid.attach(v, 1, row, 1, 1)
+            self.info[key] = v
+        root.pack_start(grid, False, False, 0)
+
+        # actions
+        btns = Gtk.Box(spacing=8)
+        self.reconnect_btn = Gtk.Button(label="Reconnect now")
+        self.reconnect_btn.connect("clicked", lambda *_: app.reconnect())
+        self.pause_btn = Gtk.Button()
+        self.pause_btn.connect("clicked", lambda *_: app.toggle_pause())
+        dash_btn = Gtk.Button(label="Open dashboard")
+        dash_btn.connect("clicked", lambda *_: app.open_dashboard())
+        for b in (self.reconnect_btn, self.pause_btn, dash_btn):
+            btns.pack_start(b, False, False, 0)
+        self.action_lbl = Gtk.Label(xalign=0)
+        self.action_lbl.get_style_context().add_class("dim-label")
+        btns.pack_start(self.action_lbl, True, True, 6)
+        root.pack_start(btns, False, False, 0)
+
+        self.stats_lbl = Gtk.Label(xalign=0, wrap=True)
+        root.pack_start(self.stats_lbl, False, False, 0)
+
+        # history
+        nb = Gtk.Notebook()
+        self.out_store = Gtk.ListStore(str, str, str)
+        nb.append_page(self._table(self.out_store, ["Went offline", "Offline for", "Fixed by"]),
+                       Gtk.Label(label="Outages"))
+        self.ev_store = Gtk.ListStore(str, str)
+        nb.append_page(self._table(self.ev_store, ["Time", "Event"]), Gtk.Label(label="Activity log"))
+        root.pack_start(nb, True, True, 0)
+
+        # alerts
+        alerts = Gtk.Grid(column_spacing=10, row_spacing=6)
+        self.tg_switch = Gtk.Switch(active=config_get("TELEGRAM_ALERTS", "1") == "1", valign=Gtk.Align.CENTER)
+        self.tg_switch.connect("notify::active", lambda s, _: config_set("TELEGRAM_ALERTS", "1" if s.get_active() else "0"))
+        self.desk_switch = Gtk.Switch(active=config_get("DESKTOP_ALERTS", "1") == "1", valign=Gtk.Align.CENTER)
+        self.desk_switch.connect("notify::active", lambda s, _: config_set("DESKTOP_ALERTS", "1" if s.get_active() else "0"))
+        test_btn = Gtk.Button(label="Send test")
+        test_btn.connect("clicked", lambda *_: app.test_telegram())
+        self.tg_lbl = Gtk.Label(xalign=0)
+        self.tg_lbl.get_style_context().add_class("dim-label")
+        alerts.attach(Gtk.Label(label="Telegram alert after an outage", xalign=0), 0, 0, 1, 1)
+        alerts.attach(self.tg_switch, 1, 0, 1, 1)
+        alerts.attach(test_btn, 2, 0, 1, 1)
+        alerts.attach(self.tg_lbl, 3, 0, 1, 1)
+        alerts.attach(Gtk.Label(label="Desktop notifications", xalign=0), 0, 1, 1, 1)
+        alerts.attach(self.desk_switch, 1, 1, 1, 1)
+        root.pack_start(alerts, False, False, 0)
+
+    @staticmethod
+    def _table(store, headers):
+        view = Gtk.TreeView(model=store)
+        for i, h in enumerate(headers):
+            col = Gtk.TreeViewColumn(h, Gtk.CellRendererText(), text=i)
+            col.set_resizable(True)
+            view.append_column(col)
+        sw = Gtk.ScrolledWindow(min_content_height=180)
+        sw.add(view)
+        return sw
+
+    def refresh(self, st: Status, outages: list, tailscale_ip: str):
+        self.big_icon.set_from_pixbuf(icon_pixbuf(st.level, 56))
+        self.title_lbl.set_markup(f"<span size='x-large' weight='bold'>{GLib.markup_escape_text(st.title)}</span>")
+        self.sub_lbl.set_text(st.since)
+        self.info["Network"].set_text(st.network or "—")
+        self.info["Signal"].set_text(st.signal or "—")
+        self.info["This PC"].set_text(st.ip or "—")
+        self.info["Dashboard (home WiFi)"].set_text(f"http://{st.ip}:{DASH_PORT}" if st.ip else "—")
+        self.info["Dashboard (Tailscale)"].set_text(f"http://{tailscale_ip}:{DASH_PORT}" if tailscale_ip else "—")
+        self.info["Guard service"].set_text(
+            "paused" if st.paused else "running (starts at boot)" if st.guard_running else "NOT running")
+        self.pause_btn.set_label("Resume guard" if st.paused else "Pause guard")
+
+        now = time.time()
+        midnight = time.mktime(time.localtime()[:3] + (0, 0, 0, 0, 0, -1))
+        week = [o for o in outages if o[0] >= now - 7 * 86400]
+        long_ = [o for o in week if o[2] >= GRACE]
+        self.stats_lbl.set_markup(
+            f"<b>{sum(o[0] >= midnight for o in outages)}</b> drops today · "
+            f"<b>{len(week)}</b> in the last 7 days, <b>{len(long_)}</b> lasted over {GRACE}s · "
+            f"offline <b>{human(sum(o[2] for o in week))}</b> in total this week")
+        pending = len(read_lines(ALERTS))
+        self.tg_lbl.set_text(f"{pending} waiting to send" if pending else "")
+
+        sig = (len(outages), outages[-1] if outages else None)
+        if sig != self._outages_sig:
+            self._outages_sig = sig
+            self.out_store.clear()
+            for start, _end, dur, fixer in reversed(outages[-300:]):
+                self.out_store.append([time.strftime("%a %d %b %H:%M:%S", time.localtime(start)), human(dur), fixer])
+        try:
+            sig = os.stat(EVENTS).st_mtime
+        except OSError:
+            sig = None
+        if sig != self._events_sig:
+            self._events_sig = sig
+            self.ev_store.clear()
+            for line in reversed(read_lines(EVENTS)[-300:]):
+                ts, _, msg = line.partition("\t")
+                if ts.isdigit():
+                    self.ev_store.append([time.strftime("%d %b %H:%M:%S", time.localtime(int(ts))), msg])
+
+
+# ---------------------------------------------------------------- app
+class GuardApp(Gtk.Application):
+    def __init__(self):
+        super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.HANDLES_COMMAND_LINE)
+        self.window = self.tray = self.status = None
+        self.busy = ""
+        self.tailscale_ip = ""
+        self.seen_outages = None
+        self.last_level = None
+
+    def do_startup(self):
+        Gtk.Application.do_startup(self)
+        Notify.init("WiFi Guard")
+        self.hold()  # keep running with only the top-bar icon
+        self.tailscale_ip = sh("tailscale", "ip", "-4", timeout=3).split("\n")[0]
+        self.window = GuardWindow(self)
+        self.tray = TrayIcon(self)
+        self.tick()
+        GLib.timeout_add_seconds(3, self.tick)
+
+    def do_command_line(self, cmd):
+        if "--show" in cmd.get_arguments()[1:]:
+            self.show_window()
+        return 0
+
+    def show_window(self):
+        self.window.show_all()
+        self.window.present()
+
+    # -- periodic refresh
+    def tick(self):
+        st = self.status = Status()
+        outages = load_outages()
+        self._notify_changes(st, outages)
+        self.window.refresh(st, outages, self.tailscale_ip)
+        self.window.reconnect_btn.set_sensitive(not self.busy)
+        self.window.action_lbl.set_text(self.busy)
+        tip = st.title + (f" ({st.since})" if st.since else "")
+        self.tray.update(st.level, tip, [
+            menu_item(1, tip, enabled=False),
+            menu_item(2, separator=True),
+            menu_item(3, "Open WiFi Guard", self.show_window),
+            menu_item(4, "Reconnecting…" if self.busy else "Reconnect now", self.reconnect, enabled=not self.busy),
+            menu_item(5, "Resume guard" if st.paused else "Pause guard", self.toggle_pause),
+            menu_item(6, "Open dashboard", self.open_dashboard),
+            menu_item(7, separator=True),
+            menu_item(8, "Hide this icon (guard keeps running)", self.quit),
+        ])
+        return True
+
+    def _notify_changes(self, st: Status, outages: list):
+        desk = config_get("DESKTOP_ALERTS", "1") == "1"
+        if self.seen_outages is not None and desk:
+            for _start, _end, dur, fixer in outages[self.seen_outages:]:
+                if dur >= GRACE:
+                    self.desktop_note("WiFi is back", f"Offline for {human(dur)} — reconnected by {fixer}.")
+            if st.level == "down" and self.last_level != "down":
+                self.desktop_note("WiFi is down", "WiFi Guard is reconnecting to your saved network…")
+        self.seen_outages, self.last_level = len(outages), st.level
+
+    @staticmethod
+    def desktop_note(title, body):
+        try:
+            Notify.Notification.new(title, body, "network-wireless-symbolic").show()
+        except GLib.Error:
+            pass
+
+    # -- actions
+    def _run(self, argv, busy_text, done):
+        self.busy = busy_text
+        self.tick()
+        proc = Gio.Subprocess.new(argv, Gio.SubprocessFlags.STDOUT_SILENCE | Gio.SubprocessFlags.STDERR_SILENCE)
+
+        def finished(p, res):
+            try:
+                p.wait_finish(res)
+                ok = p.get_successful()
+            except GLib.Error:
+                ok = False
+            self.busy = ""
+            done(ok)
+            self.tick()
+        proc.wait_async(None, finished)
+
+    def reconnect(self):
+        if self.busy:
+            return
+        if self.status and self.status.connected:
+            dlg = Gtk.MessageDialog(transient_for=self.window if self.window.get_visible() else None,
+                                    modal=True, message_type=Gtk.MessageType.QUESTION,
+                                    buttons=Gtk.ButtonsType.OK_CANCEL,
+                                    text="You are connected right now.")
+            dlg.format_secondary_text("Reconnecting will drop the WiFi for a few seconds. Continue?")
+            answer = dlg.run()
+            dlg.destroy()
+            if answer != Gtk.ResponseType.OK:
+                return
+        self._run([GUARD, "reconnect"], "Reconnecting…",
+                  lambda ok: self.window.action_lbl.set_text("" if ok else "Reconnect failed — see activity log"))
+
+    def toggle_pause(self):
+        sh(GUARD, "resume" if os.path.exists(PAUSE_FILE) else "pause")
+        self.tick()
+
+    def open_dashboard(self):
+        Gio.AppInfo.launch_default_for_uri(f"http://localhost:{DASH_PORT}", None)
+
+    def test_telegram(self):
+        self._run([NOTIFY_BIN, "--test"], "Sending test alert…",
+                  lambda ok: self.desktop_note("WiFi Guard", "Telegram test sent." if ok else
+                                               "Telegram test could not be sent yet — it stays queued."))
+
+
+if __name__ == "__main__":
+    sys.exit(GuardApp().run(sys.argv))

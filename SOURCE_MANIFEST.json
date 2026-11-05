@@ -1,0 +1,39 @@
+{
+  "exported_at": "2026-11-05T12:03:55Z",
+  "source_home": "<workspace>",
+  "repo": "r2d2-wifi-guard",
+  "files": [
+    {
+      "source": "<workspace>/.local/bin/wifi-guard",
+      "path": "bin/wifi-guard",
+      "source_sha256": "31b7dfbbddb6b5d2189c01a91a2284a603a445ec6dbb2c281d78156c74ec13b6",
+      "export_sha256": "31b7dfbbddb6b5d2189c01a91a2284a603a445ec6dbb2c281d78156c74ec13b6"
+    },
+    {
+      "source": "<workspace>/.local/bin/wifi-guard-ui",
+      "path": "bin/wifi-guard-ui",
+      "source_sha256": "cc4b6280928b03b0ffc833dad9c6c2e905cb0c8e27c98afd7d4e5cfb60c8e587",
+      "export_sha256": "cc4b6280928b03b0ffc833dad9c6c2e905cb0c8e27c98afd7d4e5cfb60c8e587"
+    },
+    {
+      "source": "<workspace>/.local/bin/wifi-guard-notify",
+      "path": "bin/wifi-guard-notify",
+      "source_sha256": "47fd8370e86f5c5e0be8eb5db1b1a6afd59589a14489f8d145f0f34c2e40cca1",
+      "export_sha256": "db41182533271faf9756ace6d6da72a6f36619dc402063c876231ae9a646682a"
+    },
+    {
+      "source": "<workspace>/.config/systemd/user/wifi-guard.service",
+      "path": "systemd/wifi-guard.service",
+      "source_sha256": "3b0cdb148596276493a7001af5755107677a9e56d0e35a364b8e285c0a600749",
+      "export_sha256": "3b0cdb148596276493a7001af5755107677a9e56d0e35a364b8e285c0a600749"
+    },
+    {
+      "source": "<workspace>/.local/share/applications/com.r2d2.WifiGuard.desktop",
+      "path": "desktop/com.r2d2.WifiGuard.desktop",
+      "source_sha256": "c746a176311f00727b8bfb6734d2f0a92d1a860db974e5ca10a765f3fce1e63a",
+      "export_sha256": "70490bf34b4401ba9e23713b199046c47a44804cdef7c4b76cf76d32c325b0d4"
+    }
+  ],
+  "adaptations": "Toolkit copies may adapt absolute paths or remove optional cross-repo notification dependencies; source and export hashes expose this.",
+  "privacy": "Export sanitized: credentials/private runtime state excluded; personal email, workstation paths and literal IP addresses removed."
+}

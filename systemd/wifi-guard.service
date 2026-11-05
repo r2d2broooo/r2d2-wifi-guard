@@ -1,0 +1,10 @@
+[Unit]
+Description=WiFi guard — reconnect the saved WiFi whenever the link drops
+
+[Service]
+ExecStart=%h/.local/bin/wifi-guard run
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target

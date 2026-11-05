@@ -1,0 +1,179 @@
+#!/usr/bin/env bash
+# wifi-guard — keep this machine on WiFi so the dashboard stays reachable.
+#
+# Why: the router drops us about once an hour. NetworkManager normally heals
+# that in seconds, but when the reconnect handshake fails it asks for the
+# password, no agent answers ("no secrets"), and it then gives up for good —
+# outages of 4-15h were measured in the logs. This loop notices and re-activates
+# the saved connection itself (the stored password is used; nothing is asked).
+#
+# Works with no internet at all: it only talks to NetworkManager and pings the
+# router. The top-bar icon / window (wifi-guard-ui) and Telegram alerts
+# (wifi-guard-notify) are optional extras that read the files in $STATE_DIR.
+#
+#   wifi-guard run        the watchdog loop (what the systemd user service runs)
+#   wifi-guard status     current link + last guard events
+#   wifi-guard reconnect  reconnect now
+#   wifi-guard pause      stop intervening (e.g. you want WiFi off on purpose)
+#   wifi-guard resume     intervene again
+set -u
+
+IFACE=${WIFI_GUARD_IFACE:-wlp4s0}
+INTERVAL=${WIFI_GUARD_INTERVAL:-15}      # seconds between checks
+GRACE=${WIFI_GUARD_GRACE:-45}            # let NetworkManager self-heal first
+PING_FAILS_MAX=${WIFI_GUARD_PING_FAILS:-4}  # connected-but-dead checks before a reconnect
+CONFIG_DIR=$HOME/.config/wifi-guard
+STATE_DIR=$HOME/.local/state/wifi-guard
+PAUSE_FILE=$CONFIG_DIR/paused
+EVENTS=$STATE_DIR/events.log             # "epoch<TAB>message"
+OUTAGES=$STATE_DIR/outages.tsv           # "start<TAB>end<TAB>seconds<TAB>fixed by"
+PHASE=$STATE_DIR/phase                   # "phase<TAB>since-epoch"
+ALERTS=$STATE_DIR/pending_alerts         # one Telegram message per line
+NOTIFY=$HOME/.local/bin/wifi-guard-notify
+mkdir -p "$CONFIG_DIR" "$STATE_DIR"
+
+log() {   # journald adds its own timestamp; the file is what the UI reads
+    echo "$*"
+    printf '%s\t%s\n' "$(date +%s)" "$*" >>"$EVENTS"
+}
+
+set_phase() {   # only rewrite on change so "since" stays meaningful
+    [ "$(cut -f1 "$PHASE" 2>/dev/null)" = "$1" ] || printf '%s\t%s\n' "$1" "$(date +%s)" >"$PHASE"
+}
+
+config() {   # config <KEY> <default>
+    local v
+    v=$(grep -s "^$1=" "$CONFIG_DIR/config" | tail -1 | cut -d= -f2-)
+    echo "${v:-$2}"
+}
+
+human() {   # seconds -> "1h 05m" / "3m 12s" / "40s"
+    local s=$1
+    if (( s >= 3600 )); then printf '%dh %02dm' $((s/3600)) $((s%3600/60))
+    elif (( s >= 60 )); then printf '%dm %02ds' $((s/60)) $((s%60))
+    else printf '%ds' "$s"; fi
+}
+
+flush_alerts() {   # background, never blocks the guard; notifier keeps unsent lines
+    [ -s "$ALERTS" ] && [ -x "$NOTIFY" ] && (timeout 90 "$NOTIFY" >/dev/null 2>&1 &)
+}
+
+dev_state() {   # numeric NM device state: 100 connected, 60 need-auth, 30 disconnected, 20 unavailable ...
+    nmcli -g GENERAL.STATE device show "$IFACE" 2>/dev/null | awk '{print $1}'
+}
+
+gateway_ok() {
+    local gw
+    gw=$(ip route show default dev "$IFACE" 2>/dev/null | awk '{print $3; exit}')
+    [ -n "$gw" ] && ping -c1 -W2 -I "$IFACE" "$gw" >/dev/null 2>&1
+}
+
+# Saved WiFi connections whose SSID is on the air now, best first
+# (autoconnect priority, then most recently used).
+visible_saved() {
+    local ssids uuid prio ts ssid
+    ssids=$(nmcli -t -f SSID device wifi list ifname "$IFACE" --rescan yes 2>/dev/null)
+    nmcli -t -f UUID,TYPE,AUTOCONNECT-PRIORITY,TIMESTAMP connection show 2>/dev/null |
+        awk -F: '$2=="802-11-wireless"{print $3, $4, $1}' | sort -k1,1nr -k2,2nr |
+        while read -r prio ts uuid; do
+            ssid=$(nmcli -g 802-11-wireless.ssid connection show uuid "$uuid" 2>/dev/null)
+            grep -qxF -- "$ssid" <<<"$ssids" && echo "$uuid"
+        done
+}
+
+conn_name() { nmcli -g connection.id connection show uuid "$1" 2>/dev/null; }
+
+reconnect() {
+    local uuid
+    for uuid in $(visible_saved); do
+        log "reconnecting to '$(conn_name "$uuid")'"
+        if timeout 60 nmcli --wait 45 connection up uuid "$uuid" ifname "$IFACE" >/dev/null 2>&1; then
+            log "connected to '$(conn_name "$uuid")'"
+            return 0
+        fi
+        log "  failed on '$(conn_name "$uuid")'"
+    done
+    return 1
+}
+
+record_outage() {   # record_outage <start-epoch> <fixed-by>
+    local start=$1 fixer=$2 end dur msg
+    end=$(date +%s); dur=$(( end - start ))
+    printf '%s\t%s\t%s\t%s\n' "$start" "$end" "$dur" "$fixer" >>"$OUTAGES"
+    log "back online after $(human "$dur") (fixed by $fixer)"
+    # Short blips heal by themselves every hour — only alert when the guard had to wait/act.
+    if (( dur >= GRACE )) && [ "$(config TELEGRAM_ALERTS 1)" = 1 ]; then
+        msg="📶 WiFi guard: $(hostname -s) was offline $(human "$dur") ($(date -d "@$start" '%a %H:%M')–$(date -d "@$end" '%H:%M')), reconnected by $fixer to '$(nmcli -g GENERAL.CONNECTION device show "$IFACE" 2>/dev/null)'."
+        echo "$msg" >>"$ALERTS"
+        flush_alerts
+    fi
+}
+
+run() {
+    local down_since=0 ping_fails=0 failures=0 loops=0 fixer state now
+    log "wifi-guard started on $IFACE (check every ${INTERVAL}s, grace ${GRACE}s)"
+    while :; do
+        (( ++loops % 240 == 0 )) && { tail -n 1000 "$EVENTS" >"$EVENTS.tmp" && mv "$EVENTS.tmp" "$EVENTS"; }
+        (( loops % 20 == 0 )) && flush_alerts   # retry unsent alerts every ~5 min
+        if [ -e "$PAUSE_FILE" ]; then set_phase paused; sleep "$INTERVAL"; continue; fi
+        state=$(dev_state); now=$(date +%s)
+
+        if [ "$state" = 100 ]; then
+            if [ "$down_since" -ne 0 ]; then
+                record_outage "$down_since" "${fixer:-NetworkManager}"
+                down_since=0; failures=0; fixer=
+            fi
+            if gateway_ok; then
+                ping_fails=0; set_phase ok
+            elif (( ++ping_fails >= PING_FAILS_MAX )); then
+                log "connected but router unreachable for $(( ping_fails * INTERVAL ))s — reconnecting"
+                ping_fails=0; down_since=$now; set_phase reconnecting
+                reconnect && fixer=wifi-guard || log "reconnect failed"
+            else
+                set_phase router-unreachable
+            fi
+            sleep "$INTERVAL"; continue
+        fi
+
+        # Not connected.
+        ping_fails=0
+        if [ "$down_since" -eq 0 ]; then
+            down_since=$now; set_phase waiting
+            log "link down (device state ${state:-unknown}) — giving NetworkManager ${GRACE}s"
+        fi
+        if (( now - down_since >= GRACE )); then
+            set_phase reconnecting
+            if [ "$(nmcli -g WIFI radio 2>/dev/null)" != enabled ]; then
+                log "WiFi radio is off — turning it on"
+                nmcli radio wifi on
+                sleep 5
+            fi
+            if reconnect; then
+                failures=0; fixer=wifi-guard
+            elif (( ++failures >= 3 )); then
+                log "3 failed rounds — power-cycling the WiFi radio"
+                nmcli radio wifi off; sleep 3; nmcli radio wifi on; sleep 10
+                failures=0; fixer="wifi-guard (radio reset)"
+            else
+                set_phase no-network
+                log "no saved network reachable yet (round $failures)"
+            fi
+        fi
+        sleep "$INTERVAL"
+    done
+}
+
+case "${1:-run}" in
+    run)    run ;;
+    status)
+        nmcli -f GENERAL.STATE,GENERAL.CONNECTION device show "$IFACE"
+        [ -e "$PAUSE_FILE" ] && echo "guard: PAUSED" || echo "guard: $(systemctl --user is-active wifi-guard)"
+        tail -n 15 "$EVENTS" 2>/dev/null | while IFS=$'\t' read -r ts msg; do
+            echo "$(date -d "@$ts" '%F %T')  $msg"; done ;;
+    reconnect)
+        log "manual reconnect requested"
+        reconnect || { log "manual reconnect failed — no saved network reachable"; exit 1; } ;;
+    pause)  touch "$PAUSE_FILE" && log "guard paused" && echo "wifi-guard paused" ;;
+    resume) rm -f "$PAUSE_FILE" && log "guard resumed" && echo "wifi-guard resumed" ;;
+    *)      echo "usage: wifi-guard [run|status|reconnect|pause|resume]" >&2; exit 2 ;;
+esac

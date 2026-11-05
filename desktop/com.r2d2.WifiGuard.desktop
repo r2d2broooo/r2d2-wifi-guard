@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=WiFi Guard
+Comment=Keeps this PC on WiFi — status, outage history, reconnect
+Exec=wifi-guard-ui --show
+Icon=wifi-guard
+Categories=Network;
+Keywords=wifi;network;reconnect;guard;
+StartupNotify=false
